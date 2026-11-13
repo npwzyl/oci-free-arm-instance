@@ -87,6 +87,8 @@ jobs:
           if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
             echo "✅ VICTORY! VM is being created."
             echo "won=true" >> $GITHUB_OUTPUT
+            INSTANCE_ID=$(echo "$OCI_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('id',''))" 2>/dev/null || true)
+            echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
             exit 0
           elif echo "$OCI_OUTPUT" | grep -q 'Out of host capacity'; then
             echo "⚠️  Oracle is full (Capacity Error). This is expected. Retrying next time..."
@@ -95,12 +97,96 @@ jobs:
           elif echo "$OCI_OUTPUT" | grep -q 'LimitExceeded'; then
             echo "ℹ️  LimitExceeded: you may already have the VM. Disabling workflow."
             echo "won=true" >> $GITHUB_OUTPUT
+            INSTANCE_ID=$(oci compute instance list \
+              --compartment-id "$COMPARTMENT_ID" \
+              --display-name "arm-free-vm" \
+              --query 'data[0].id' --raw-output 2>/dev/null || true)
+            echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
             exit 0
           else
             echo "❌ Real Error Detected. Failing the workflow."
             echo "$OCI_OUTPUT"
             exit 1
           fi
+
+      # 抢到实例后发送邮件通知
+      - name: Send success email
+        if: steps.create_vm.outputs.won == 'true'
+        continue-on-error: true
+        env:
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_SSL: ${{ secrets.SMTP_SSL }}
+          NOTIFY_TO: ${{ secrets.NOTIFY_TO }}
+          INSTANCE_ID: ${{ steps.create_vm.outputs.instance_id }}
+          REGION: ${{ secrets.OCI_CLI_REGION }}
+        run: |
+          python3 - <<'PY'
+          import os, smtplib, ssl, datetime
+          from email.message import EmailMessage
+          from email.utils import formataddr
+
+          server = os.environ.get("SMTP_SERVER", "smtp.163.com")
+          port = int(os.environ.get("SMTP_PORT") or 465)
+          user = os.environ["SMTP_USER"]
+          pwd  = os.environ["SMTP_PASSWORD"]
+          to   = os.environ.get("NOTIFY_TO", user)
+          use_ssl = os.environ.get("SMTP_SSL", "true").lower() == "true"
+          inst = os.environ.get("INSTANCE_ID", "")
+          region = os.environ.get("REGION", "")
+
+          public_ip, shape = "", "VM.Standard.A1.Flex (1 OCPU / 6GB)"
+          if inst:
+              import subprocess
+              def sh(cmd):
+                  try:
+                      return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60).stdout.strip()
+                  except Exception:
+                      return ""
+              public_ip = sh(f'oci compute instance list-vnics --instance-id "{inst}" '
+                             f'--query "data[0].\\"public-ip\\"" --raw-output')
+              st = sh(f'oci compute instance get --instance-id "{inst}" '
+                      f'--query "data.\\"lifecycle-state\\"" --raw-output')
+              if st:
+                  shape = f"{shape} · 状态: {st}"
+
+          body = (
+              "Oracle Cloud 免费 ARM 实例已创建成功！\n\n"
+              f"实例名: arm-free-vm\n"
+              f"规格:   {shape}\n"
+              f"区域:   {region}\n"
+              f"公网IP: {public_ip or '(请在控制台查看)'}\n"
+              f"OCID:   {inst or '(未知)'}\n\n"
+              "登录命令:\n"
+              f"  ssh ubuntu@{public_ip or '<公网IP>'} -i ~/.ssh/oracle_free_arm\n\n"
+              "提示:\n"
+              "- 抢机 workflow 已自动停用，不会继续重试\n"
+              "- 如需扩容（免费额度内可到 4 OCPU / 24GB）:\n"
+              "  OCI 控制台 -> Compute -> Instances -> Edit shape\n\n"
+              f"时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (UTC)\n"
+          )
+
+          msg = EmailMessage()
+          msg["Subject"] = "🎉 Oracle 免费 ARM 实例已抢到！"
+          msg["From"] = formataddr(("OCI 抢机机器人", user))
+          msg["To"] = to
+          msg.set_content(body)
+
+          if use_ssl:
+              ctx = ssl.create_default_context()
+              with smtplib.SMTP_SSL(server, port, context=ctx, timeout=60) as s:
+                  s.login(user, pwd)
+                  s.send_message(msg)
+          else:
+              with smtplib.SMTP(server, port, timeout=60) as s:
+                  s.starttls(context=ssl.create_default_context())
+                  s.login(user, pwd)
+                  s.send_message(msg)
+
+          print(f"✅ 邮件已发送至 {to}，公网 IP: {public_ip or '未知'}")
+          PY
 
       # 抢到实例后自动停用本 workflow，避免继续每 10 分钟尝试创建第二台
       - name: Auto-disable workflow on success
