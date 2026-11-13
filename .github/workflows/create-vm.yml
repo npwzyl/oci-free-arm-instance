@@ -5,6 +5,11 @@ on:
     - cron: "*/10 * * * *"
   workflow_dispatch:
 
+# 抢到实例后需要调用 API 停用本 workflow，因此需要 actions 写权限
+permissions:
+  actions: write
+  contents: read
+
 env:
   SUPPRESS_LABEL_WARNING: true
 
@@ -81,16 +86,29 @@ jobs:
           # --- SMART CHECK LOGIC ---
           if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
             echo "✅ VICTORY! VM is being created."
+            echo "won=true" >> $GITHUB_OUTPUT
             exit 0
           elif echo "$OCI_OUTPUT" | grep -q 'Out of host capacity'; then
             echo "⚠️  Oracle is full (Capacity Error). This is expected. Retrying next time..."
             # We exit with 0 so GitHub does not disable the cron schedule
             exit 0
           elif echo "$OCI_OUTPUT" | grep -q 'LimitExceeded'; then
-            echo "ℹ️  LimitExceeded: you may already have the VM. Check OCI console and disable this workflow."
+            echo "ℹ️  LimitExceeded: you may already have the VM. Disabling workflow."
+            echo "won=true" >> $GITHUB_OUTPUT
             exit 0
           else
             echo "❌ Real Error Detected. Failing the workflow."
             echo "$OCI_OUTPUT"
             exit 1
           fi
+
+      # 抢到实例后自动停用本 workflow，避免继续每 10 分钟尝试创建第二台
+      - name: Auto-disable workflow on success
+        if: steps.create_vm.outputs.won == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🎉 实例已创建，正在停用 workflow…"
+          gh workflow disable create-vm.yml --repo "${{ github.repository }}"
+          echo "✅ workflow 已停用，不再自动重试。"
